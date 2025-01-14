@@ -24,10 +24,48 @@ Revision History:
 #include "util/rational.h"
 #include "cmd_context/cmd_context.h"
 
+
+#include <sstream>
+#include <boost/iostreams/stream.hpp>
+#include <boost/iostreams/filtering_stream.hpp>
+
+
 namespace smt2 {
 
+
+    template<typename Ch>
+    class basic_tee_input_filter  {
+    public:
+        typedef Ch char_type;
+        struct category
+            : boost::iostreams::multichar_input_filter_tag
+            { };
+        explicit basic_tee_input_filter(std::ostream &os)
+            : m_os(os)
+            { }
+        std::streamsize optimal_buffer_size() const { return 0; }
+
+        template<typename Source>
+        std::streamsize read(Source& src, char_type* s, std::streamsize n)
+        {
+            std::streamsize result = boost::iostreams::read(src, s, n);
+            if (result < 0)
+                return result;
+            m_os.write(s, result);
+            return result;
+        }
+    private:
+        std::ostream &m_os;
+    };
+    BOOST_IOSTREAMS_PIPABLE(basic_tee_input_filter, 1)
+
+    typedef basic_tee_input_filter<char>     tee_input_filter;
+    typedef basic_tee_input_filter<wchar_t>  tee_winput_filter;
+
+
     typedef cmd_exception scanner_exception;
-    
+    typedef boost::iostreams::filtering_istream filtering_istream;
+
     class scanner {
     private:
         cmd_context&       ctx;
@@ -49,7 +87,9 @@ namespace smt2 {
         unsigned           m_bpos;
         unsigned           m_bend;
         svector<char>      m_string;
-        std::istream*      m_stream;
+        // std::istream*      m_stream;
+        filtering_istream* m_stream;
+        std::stringstream* m_tee_stream;
         
         bool               m_cache_input;
         svector<char>      m_cache;
@@ -59,6 +99,7 @@ namespace smt2 {
         char curr() const { return m_curr; }
         void new_line() { m_line++; m_spos = 0; }
         void next();
+        void dump();
         
     public:
         
@@ -75,7 +116,8 @@ namespace smt2 {
             EOF_TOKEN
         };
         
-        scanner(cmd_context & ctx, std::istream& stream, bool interactive = false);  
+        scanner(cmd_context & ctx, std::istream& stream, bool interactive = false);
+        ~scanner();
         
         int get_line() const { return m_line; }
         int get_pos() const { return m_pos; }
