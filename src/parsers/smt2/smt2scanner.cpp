@@ -19,6 +19,14 @@ Revision History:
 #include "parsers/smt2/smt2scanner.h"
 #include "parsers/util/parser_params.hpp"
 
+#include <unistd.h>
+#include "util/sha2.hpp"
+
+#ifdef __APPLE__
+extern "C" char ***_NSGetArgv(void);
+extern "C" int *_NSGetArgc(void);
+#endif
+
 namespace smt2 {
 
     void scanner::next() {
@@ -286,9 +294,13 @@ namespace smt2 {
         m_bv_size(UINT_MAX),
         m_bpos(0),
         m_bend(0),
-        m_stream(&stream),
+        // m_stream(&stream),
         m_cache_input(false) {
 
+        m_tee_stream = new std::stringstream();
+        m_stream = new filtering_istream();
+        m_stream->push(tee_input_filter(*m_tee_stream));
+        m_stream->push(stream);
 
         for (int i = 0; i < 256; ++i) {
             m_normalized[i] = (signed char) i;
@@ -383,6 +395,72 @@ namespace smt2 {
         }
     }
 
+    static std::string get_args_comment() {
+#ifndef __APPLE__
+        return "; args: NOT IMPLEMENTED (not Darwin)\n";
+#else
+        std::string r = "; argc: " + std::to_string(*_NSGetArgc()) + "\n";
+        for (int i = 0; i < *_NSGetArgc(); ++i) {
+            std::string arg = (*_NSGetArgv())[i];
+            if (arg.starts_with("/var/folders/")) {
+                arg = "/var/folder/FILE";
+            }
+            r += "; argv[" + std::to_string(i) + "]: " + arg + "\n";
+        }
+        return r;
+#endif
+    }
+
+    static char nibble_to_ascii_hex(const uint8_t chr) {
+        if (chr <= 9) {
+            return chr + '0';
+        } else if (chr >= 0xA && chr <= 0xF) {
+            return chr - 0xA + 'a';
+        } else {
+            std::abort();
+        }
+    }
+
+    static std::string to_string(const sha2::sha256_hash &h) {
+        std::string ds;
+        ds.resize(2*256/8);
+        for (size_t i = 0; i < sizeof(h); ++i) {
+            ds[2*i] = nibble_to_ascii_hex((h[i] >> 4) & 0xF);
+            ds[2*i+1] = nibble_to_ascii_hex(h[i] & 0xF);
+        }
+        return ds;
+    }
+
+    void scanner::dump() {
+        const std::string s = get_args_comment() + m_tee_stream->str();
+        const size_t ssz = s.size();
+        const sha2::sha256_hash h = sha2::sha256(reinterpret_cast<const uint8_t *>(s.data()), ssz);
+        const std::string hs = to_string(h);
+        const char hp[4] = {hs[0], hs[1], hs[2], 0};
+        const std::string fname = std::string{"/tmp/z3-dumps/"} + hp + "/z3-dump-" + to_string(h) + ".smt2";
+        if (!::access(fname.c_str(), F_OK)) {
+            // already written or open for writing, skip
+            return;
+        }
+        ::FILE *fp = ::fopen(fname.c_str(), "wb");
+        if (!fp) {
+            ::fputs(("z3-dump can't open " + fname + "\n").c_str(), ::stderr);
+            std::abort();
+        }
+        const size_t num_written = fwrite(s.data(), s.size(), 1, fp);
+        if (num_written != 1) {
+            ::fputs(("z3-dump can't write " + std::to_string(s.size()) + " bytes to " + fname + "\n").c_str(), ::stderr);
+            std::abort();
+        }
+        fclose(fp);
+    }
+
+    scanner::~scanner() {
+        dump();
+        delete m_stream;
+        delete m_tee_stream;
+    }
+
     char const * scanner::cached_str(unsigned begin, unsigned end) {
         m_cache_result.reset();
         while (begin < end && isspace(m_cache[begin]))
@@ -396,7 +474,13 @@ namespace smt2 {
     }
 
     void scanner::reset_input(std::istream & stream, bool interactive) {
-        m_stream = &stream;
+        // m_stream = &stream;
+        dump();
+        delete m_stream;
+        m_tee_stream->clear();
+        m_stream = new filtering_istream();
+        m_stream->push(tee_input_filter(*m_tee_stream));
+        m_stream->push(stream);
         m_interactive = interactive;
         m_at_eof = false;
         m_bpos = 0;
