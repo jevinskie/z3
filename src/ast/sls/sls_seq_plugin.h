@@ -43,8 +43,9 @@ namespace sls {
         };
 
         enum edit_distance_strategy {
-            EDIT_CHAR,
-            EDIT_SUBSTR,
+            EDIT_CHAR = 0,
+            EDIT_SUBSTR = 1,
+            EDIT_COMBINED = 2,
         };
 
         seq_util seq;
@@ -68,6 +69,7 @@ namespace sls {
         };
         vector<str_update> m_str_updates;
         vector<int_update> m_int_updates;
+
         bool apply_update();
         bool update(expr* e, zstring const& value);
         bool update(expr* e, rational const& value);
@@ -127,12 +129,15 @@ namespace sls {
         void init_string_instance(ptr_vector<expr> const& es, string_instance& a);
         unsigned edit_distance_with_updates(string_instance const& a, string_instance const& b);
         unsigned edit_distance(zstring const& a, zstring const& b);
-        void add_edit_updates(ptr_vector<expr> const& w, zstring const& val, zstring const& val_other, uint_set const& chars);
+        void add_edit_updates(ptr_vector<expr> const& w, zstring const& val, zstring const& val_other, uint_set const& chars, unsigned diff);
         void add_char_edit_updates(ptr_vector<expr> const& w, zstring const& val, zstring const& val_other, uint_set const& chars);
         void add_substr_edit_updates(ptr_vector<expr> const& w, zstring const& val, zstring const& val_other, uint_set const& chars);
 
-        int add_str_update(expr* e, zstring const& val, double score);
-        zstring trunc_pad_to_fit(unsigned min_length, unsigned max_length, zstring const& s);
+        int add_str_update(expr* e, zstring const& currVal, zstring const& val, double score);
+        zstring trunc_pad_to_fit(unsigned min_length, unsigned max_length, zstring const& s) const;
+        zstring trunc_pad_to_fit(unsigned length, zstring const& s) const {
+            return trunc_pad_to_fit(length, length, s);
+        }
 
         // regex functionality
         
@@ -147,6 +152,10 @@ namespace sls {
         void next_char(expr* r, unsigned_vector& chars);
 
         bool is_in_re(zstring const& s, expr* r);
+
+        bool is_num_string(zstring const& s); // Checks if s \in [0-9]+ (i.e., str.to_int is not -1)
+
+        unsigned random_char() const;
 
         // access evaluation
         bool is_seq_predicate(expr* e);

@@ -4545,6 +4545,33 @@ br_status seq_rewriter::mk_str_in_regexp(expr* a, expr* b, expr_ref& result) {
         result = m().mk_true();
         return BR_DONE;
     }
+
+    zstring s;
+    if (str().is_string(a, s) && re().is_ground(b)) {
+        // Just check membership and replace by true/false
+        expr_ref r(b, m());
+        for (unsigned i = 0; i < s.length(); i++) {
+            if (re().is_empty(r)) {
+                result = m().mk_false();
+                return BR_DONE;
+            }
+            unsigned ch = s[i];
+            expr_ref new_r = mk_derivative(m_util.mk_char(ch), r);
+            r = new_r;
+        }
+
+        switch (re().get_info(r).nullable) {
+        case l_true:
+            result = m().mk_true();
+            return BR_DONE;
+        case l_false:
+            result = m().mk_false();
+            return BR_DONE;
+        default:
+            break;
+        }
+    }
+
     expr_ref b_s(m());
     if (lift_str_from_to_re(b, b_s)) {
        result = m_br.mk_eq_rw(a, b_s);

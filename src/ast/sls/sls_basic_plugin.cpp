@@ -81,7 +81,7 @@ namespace sls {
     }
 
     expr_ref basic_plugin::eval_ite(app* e) {
-        expr* c, * th, * el;
+        expr* c = nullptr, * th = nullptr, * el = nullptr;
         VERIFY(m.is_ite(e, c, th, el));
         if (bval0(c))
             return ctx.get_value(th);
@@ -108,7 +108,7 @@ namespace sls {
 
     bool basic_plugin::bval0(expr* e) const {
         SASSERT(m.is_bool(e));     
-        return ctx.is_true(ctx.mk_literal(e));
+        return ctx.is_true(e);
     }
 
     bool basic_plugin::try_repair(app* e, unsigned i) {

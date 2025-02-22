@@ -22,18 +22,14 @@ Author:
 #include "ast/ast_trail.h"
 #include "ast/arith_decl_plugin.h"
 #include "ast/sls/sls_context.h"
+#include "ast/sls/sls_arith_clausal.h"
+#include "ast/sls/sls_arith_lookahead.h"
 
 namespace sls {
 
     using theory_var = int;
 
-    enum arith_move_type {
-        hillclimb,
-        random_update,
-        random_inc_dec
-    };
-
-    std::ostream& operator<<(std::ostream& out, arith_move_type mt);
+    static const unsigned null_arith_var = UINT_MAX;
 
     // local search portion for arithmetic
     template<typename num_t>
@@ -65,13 +61,15 @@ namespace sls {
             unsigned restart_base = 1000;
             unsigned restart_next = 1000;
             unsigned restart_init = 1000;
-            bool     arith_use_lookahead = false;
+            bool     use_lookahead = false;
+            bool     use_clausal_lookahead = false;
+            bool     allow_plateau = false;
         };
 
         struct stats {
-            unsigned m_num_steps = 0;
-            unsigned m_moves = 0;
+            unsigned m_steps = 0;
             unsigned m_restarts = 0;
+            unsigned m_propagations = 0;
         };
 
     public:
@@ -114,31 +112,42 @@ namespace sls {
             arith_op_kind m_op = arith_op_kind::LAST_ARITH_OP;
             unsigned     m_def_idx = UINT_MAX;
             vector<std::pair<num_t, sat::bool_var>> m_linear_occurs;
-            unsigned_vector m_muls;
-            unsigned_vector m_adds;
+            sat::bool_var_vector m_bool_vars_of;
+            unsigned_vector m_clauses_of;
+            unsigned_vector m_muls, m_adds, m_ops, m_ifs;
             optional<bound> m_lo, m_hi;
             vector<num_t> m_finite_domain;
 
             num_t const& value() const { return m_value; }
             void set_value(num_t const& v) { m_value = v; }
 
+            bool is_arith_op() const { return m_def_idx < UINT_MAX - 1; }
+            bool is_if_op() const { return m_def_idx == UINT_MAX - 1; }
+
             num_t const& best_value() const { return m_best_value; }
             void set_best_value(num_t const& v) { m_best_value = v; }
+
+            bool is_big_num() const;
 
             bool in_range(num_t const& n) {
                 if (-m_range < n && n < m_range)
                     return true;
                 bool result = false;
+#if 0
+                if (m_lo && m_lo->value > n)
+                    return false;
+                if (m_hi && m_hi->value < n)
+                    return false;
+#endif
                 if (m_lo)
                     result = n < m_lo->value + m_range;
                 if (!result && m_hi)
                     result = n > m_hi->value - m_range;
-#if 0
-                if (!result) 
-                    out_of_range();
-                else 
-                    ++m_num_in_range;
-#endif
+                if (!result && m_lo && m_hi)
+                    result = m_hi->value - m_lo->value > 2 * m_range;
+                if (!result && is_big_num() && !m_lo && !m_hi) 
+                    result = true;
+                
                 return result;                
             }
             unsigned m_tabu_pos = 0, m_tabu_neg = 0;
@@ -152,6 +161,9 @@ namespace sls {
                 else
                     m_tabu_neg = tabu_step, m_last_neg = step;
             }
+            unsigned last_step(num_t const& delta) const {
+                return delta > 0 ? m_last_pos : m_last_neg;
+            }
             void out_of_range() {
                 ++m_num_out_of_range;
                 if (m_num_out_of_range < 1000 * (1 + m_num_in_range))
@@ -161,6 +173,8 @@ namespace sls {
                 m_num_out_of_range = 0;
                 m_num_in_range = 0;
             }
+
+            std::ostream& display_range(std::ostream& out) const;
         };
 
         struct mul_def {
@@ -200,9 +214,17 @@ namespace sls {
         sat::literal                 m_last_literal = sat::null_literal;
         num_t                        m_last_delta { 0 };
         bool                         m_use_tabu = true;
+        bool                         m_allow_recursive_delta = false;
         unsigned                     m_updates_max_size = 45;
         arith_util                   a;
+        friend class arith_clausal<num_t>;
+        friend class arith_lookahead<num_t>;
+        arith_clausal<num_t>         m_clausal_sls;
+        arith_lookahead<num_t>       m_lookahead_sls;
         svector<double>              m_prob_break;
+        indexed_uint_set             m_bool_var_atoms;
+        indexed_uint_set             m_tmp_set;
+        nat_set  m_tmp_nat_set;
 
         void invariant();
         void invariant(ineq const& i);
@@ -219,6 +241,7 @@ namespace sls {
         bool repair_mod(op_def const& od);
         bool repair_idiv(op_def const& od);
         bool repair_div(op_def const& od);
+        bool repair_div_idiv(op_def const& od, num_t const& val, num_t const& v1, num_t const& v2);
         bool repair_rem(op_def const& od);
         bool repair_power(op_def const& od);
         bool repair_abs(op_def const& od);
@@ -232,6 +255,11 @@ namespace sls {
         num_t mul_value_without(var_t m, var_t x);
 
         void add_update(var_t v, num_t delta);
+        void add_update(op_def const& od, num_t const& delta);
+        void add_update_mod(op_def const& od, num_t const& delta);
+        void add_update_add(add_def const& ad, num_t const& delta);
+        void add_update_mul(mul_def const& md, num_t const& delta);
+        void add_update_idiv(op_def const& od, num_t const& delta);
         bool is_permitted_update(var_t v, num_t const& delta, num_t& delta_out);
 
 
@@ -261,10 +289,14 @@ namespace sls {
 
         bool is_mul(var_t v) const { return m_vars[v].m_op == arith_op_kind::OP_MUL; }
         bool is_add(var_t v) const { return m_vars[v].m_op == arith_op_kind::OP_ADD; }
+        bool is_op(var_t v) const { return 0 <= m_vars[v].m_op && m_vars[v].m_op < arith_op_kind::LAST_ARITH_OP && m_vars[v].m_op != arith_op_kind::OP_MUL && m_vars[v].m_op != arith_op_kind::OP_ADD; }
+        bool is_if(var_t v) const { return m.is_ite(m_vars[v].m_expr); }
         mul_def const& get_mul(var_t v) const { SASSERT(is_mul(v));  return m_muls[m_vars[v].m_def_idx]; }
         add_def const& get_add(var_t v) const { SASSERT(is_add(v));  return m_adds[m_vars[v].m_def_idx]; }
+        op_def const& get_op(var_t v) const { SASSERT(is_op(v));  return m_ops[m_vars[v].m_def_idx]; }
 
-        bool update(var_t v, num_t const& new_value);
+        bool update_checked(var_t v, num_t const& new_value);
+        void update_unchecked(var_t v, num_t const& new_value);
         bool apply_update();
         bool find_nl_moves(sat::literal lit);
         bool find_lin_moves(sat::literal lit);
@@ -275,6 +307,9 @@ namespace sls {
         double compute_score(var_t x, num_t const& delta);
         void save_best_values();
 
+        void initialize_vars_of(sat::bool_var bv);
+        void initialize_of_bool_var(sat::bool_var bv);
+        void initialize_clauses_of(sat::bool_var bv, unsigned cl);
         var_t mk_var(expr* e);
         var_t mk_term(expr* e);
         var_t mk_op(arith_op_kind k, expr* e, expr* x, expr* y);
@@ -293,6 +328,8 @@ namespace sls {
 
         num_t value(var_t v) const { return m_vars[v].value(); }
         bool is_num(expr* e, num_t& i);
+        num_t to_num(rational const& r);
+        void check_real(expr* e);
         expr_ref from_num(sort* s, num_t const& n);
         void check_ineqs();
         void init_bool_var(sat::bool_var bv);
@@ -307,65 +344,8 @@ namespace sls {
         std::ostream& display(std::ostream& out, mul_def const& md) const;
 
 
-
-        // for global lookahead search mode
-        void global_search();
-        struct bool_info {
-            unsigned weight = 0;
-            double   score = 0;
-            unsigned touched = 1;
-            lbool    value = l_undef;
-            sat::bool_var_set fixable_atoms;
-            uint_set          fixable_vars;
-            ptr_vector<expr>  fixable_exprs;
-            bool_info(unsigned w) : weight(w) {}
-        };
-
-        vector<ptr_vector<app>> m_update_stack;
-        expr_mark m_in_update_stack;
-        svector<bool_info> m_bool_info;
-        double m_best_score = 0, m_top_score = 0;
-        unsigned m_min_depth = 0, m_max_depth = 0;
-        num_t m_best_value;
-        expr* m_best_expr = nullptr, * m_last_atom = nullptr, * m_last_expr = nullptr;
-        expr_mark m_is_root;
-        unsigned m_touched = 1;
-        sat::bool_var_set m_fixed_atoms;
-
-        bool_info& get_bool_info(expr* e);
-        bool get_bool_value(expr* e);
-        bool get_bool_value_rec(expr* e);
-        void set_bool_value(expr* e, bool v) { get_bool_info(e).value = to_lbool(v); }
-        bool get_basic_bool_value(app* e);
-        void initialize_bool_assignment();
-        void finalize_bool_assignment();
-        double old_score(expr* e) { return get_bool_info(e).score; }
-        double new_score(expr* e);
-        double new_score(expr* e, bool is_true);
-        void set_score(expr* e, double s) { get_bool_info(e).score = s; }
-        void rescore();
-        void recalibrate_weights();
-        void inc_weight(expr* e) { ++get_bool_info(e).weight;  }
-        void dec_weight(expr* e) { auto& i = get_bool_info(e); i.weight = i.weight > m_config.paws_init ? i.weight - 1 : m_config.paws_init; }
-        unsigned get_weight(expr* e) { return get_bool_info(e).weight; }
-        unsigned get_touched(expr* e) { return get_bool_info(e).touched; }
-        void inc_touched(expr* e) { ++get_bool_info(e).touched; }
-        void set_touched(expr* e, unsigned t) { get_bool_info(e).touched = t; }
-        void insert_update_stack(expr* t);
-        void insert_update_stack_rec(expr* t);
-        void clear_update_stack();
-        void lookahead_num(var_t v, num_t const& value);
         bool can_update_num(var_t v, num_t const& delta);
         bool update_num(var_t v, num_t const& delta);
-        void lookahead_bool(expr* e);
-        double lookahead(expr* e, bool update_score);
-        void add_lookahead(bool_info& i, expr* e);
-        ptr_vector<expr> const& get_fixable_exprs(expr* e);
-        bool apply_move(expr* f, ptr_vector<expr> const& vars, arith_move_type t);
-        expr* get_candidate_unsat();
-        void check_restart();
-        void ucb_forget();
-        void update_args_value(var_t v, num_t const& new_value);
     public:
         arith_base(context& ctx);
         ~arith_base() override {}        

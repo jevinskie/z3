@@ -8,7 +8,7 @@
 from mk_util import *
 
 def init_version():
-    set_version(4, 13, 4, 0) # express a default build version or pick up ci build version
+    set_version(4, 14, 1, 0) # express a default build version or pick up ci build version
     
 # Z3 Project definition
 def init_project_def():
@@ -53,7 +53,7 @@ def init_project_def():
     add_lib('fpa', ['ast', 'util', 'rewriter', 'model'], 'ast/fpa')
     add_lib('core_tactics', ['tactic', 'macros', 'normal_forms', 'rewriter', 'pattern'], 'tactic/core')
     add_lib('arith_tactics', ['core_tactics', 'sat'], 'tactic/arith')
-    add_lib('solver_assertions', ['pattern','smt_params','cmd_context','qe_lite'], 'solver/assertions')
+    add_lib('solver_assertions', ['pattern','smt_params','cmd_context','qe_lite', 'simplifiers', 'solver'], 'solver/assertions')
     add_lib('subpaving_tactic', ['core_tactics', 'subpaving'], 'math/subpaving/tactic')
 
     add_lib('proto_model', ['model', 'rewriter', 'smt_params'], 'smt/proto_model')

@@ -468,6 +468,7 @@ bool contains(std::string const &s, char const *pattern) {
 }
 
 void setup_args_parser(argument_parser &parser) {
+    parser.add_option_with_help_string("-add_rows", "test add_rows of static matrix");
     parser.add_option_with_help_string("-monics", "test emonics");
     parser.add_option_with_help_string("-nex_order", "test nex order");
     parser.add_option_with_help_string("-nla_cn", "test cross nornmal form");
@@ -491,6 +492,7 @@ void setup_args_parser(argument_parser &parser) {
         "-nla_blnt_fm",
         "test_basic_lemma_for_mon_neutral_from_factors_to_monomial");
     parser.add_option_with_help_string("-hnf", "test hermite normal form");
+    parser.add_option_with_help_string("-dio", "dioph equalities");
     parser.add_option_with_help_string("-gomory", "gomory");
     parser.add_option_with_help_string("-intd", "test integer_domain");
     parser.add_option_with_help_string("-xyz_sample",
@@ -1605,6 +1607,7 @@ void test_larger_generated_hnf() {
     std::cout << "test_larger_generated_rank_hnf passed" << std::endl;
 }
 #endif
+
 void test_maximize_term() {
     std::cout << "test_maximize_term\n";
     lar_solver solver;
@@ -1646,6 +1649,66 @@ void test_maximize_term() {
         std::cout << "v[" << p.first << "] = " << p.second << std::endl;
     }
 }
+
+void test_dio() {
+    std::cout << "test dio\n";
+    lar_solver solver;
+    int_solver i_solver(solver); 
+    lp::explanation exp;
+    i_solver.set_expl(&exp);
+    unsigned _x1 = 0;
+    unsigned _x2 = 1;
+    unsigned _x3 = 2;
+    unsigned _fx_7 = 3;
+    unsigned _fx_17 = 4;
+/*
+    3x1 + 3x2 + 14x3 − 7 = 0
+    7x1 + 12x2 + 31x3 − 17 = 0
+*/
+    lpvar x1 = solver.add_var(_x1, true);
+    lpvar x2 = solver.add_var(_x2, true);
+    lpvar x3 = solver.add_var(_x3, true);
+    lpvar fx_7 = solver.add_var(_fx_7, true);
+    lpvar fx_17 = solver.add_var(_fx_17, true);
+    vector<std::pair<mpq, lpvar>> term_ls;
+    /* 3x1 + 3x2 + 14x3 − 7 */
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(3), x1));
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(3), x2));
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(14), x3));
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(-1), fx_7));
+    for (auto & p: term_ls) {
+        p.first = -p.first;
+    }
+    unsigned t0 = solver.add_term(term_ls, 10);
+    term_ls.clear();
+    /* 7x1 + 12x2 + 31x3 − 17 = 0*/
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(7), x1));
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(12), x2));
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(31), x3));
+    term_ls.push_back(std::pair<mpq, lpvar>(mpq(-1), fx_17));
+    
+    for (auto & p: term_ls) {
+        p.first = -p.first;
+    }
+    unsigned t1 = solver.add_term(term_ls, 11);
+
+    solver.add_var_bound(fx_7, LE, mpq(-7));
+    solver.add_var_bound(fx_7, GE, mpq(-7));
+    solver.add_var_bound(fx_17, LE, mpq(-17));
+    solver.add_var_bound(fx_17, GE, mpq(-17));
+    solver.add_var_bound(t0, LE, mpq(0));
+    solver.add_var_bound(t0, GE, mpq(0));
+    solver.add_var_bound(t1, LE, mpq(0));
+    solver.add_var_bound(t1, GE, mpq(0));
+//    solver.find_feasible_solution();
+    //lp_assert(solver.get_status() == lp_status::OPTIMAL);
+    enable_trace("dioph_eq");
+    enable_trace("dioph_eq_fresh");
+#ifdef Z3DEBUG     
+    auto r = i_solver.dio_test();
+#endif    
+    
+}
 #ifdef Z3DEBUG
 void test_hnf() {
     test_larger_generated_hnf();
@@ -1668,6 +1731,33 @@ void test_gomory_cut() {
     test_gomory_cut_1();
 }
 
+    void test_add_rows() {
+// Create a static_matrix object
+        lp::static_matrix<mpq, impq> matrix;
+        matrix.init_empty_matrix(3, 3);
+
+        // Populate the matrix with initial values
+        matrix.set(0, 0, mpq(1));
+        matrix.set(0, 1, mpq(2));
+        matrix.set(1, 0, mpq(3));
+        matrix.set(1, 2, mpq(4));
+        matrix.set(2, 1, mpq(5));
+        matrix.set(2, 2, mpq(6));
+
+        // Perform add_rows operation
+        matrix.add_rows(mpq(2), 0, 1); // row 1 = row 1 + 2 * row 0
+
+        // Verify the results
+        SASSERT(matrix.get_elem(1, 0) == 5); // 3 + 2*1
+        SASSERT(matrix.get_elem(1, 1) == 4); // 0 + 2*2
+        SASSERT(matrix.get_elem(1, 2) == 4); // unchanged
+
+        matrix.add_rows(mpq(-2), 0, 1);
+        SASSERT(matrix.get_elem(1, 0) == 3); // 5 - 2*1
+        SASSERT(matrix.get_elem(1, 1) == 0); // 4 - 2*2
+        SASSERT(matrix.get_elem(1, 2) == 4); // unchanged
+    }
+    
 void test_nla_order_lemma() { nla::test_order_lemma(); }
 
 void test_lp_local(int argn, char **argv) {
@@ -1684,6 +1774,10 @@ void test_lp_local(int argn, char **argv) {
     }
 
     args_parser.print();
+    if (args_parser.option_is_used("-add_rows")) {
+        test_add_rows();
+        return finalize(0);
+    }
     if (args_parser.option_is_used("-monics")) {
         nla::test_monics();
         return finalize(0);

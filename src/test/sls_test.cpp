@@ -11,6 +11,7 @@ namespace bv {
     class my_sat_solver_context : public sls::sat_solver_context {
         vector<sat::clause_info> m_clauses;
         indexed_uint_set s;
+        reslimit m_limit;
     public:
         my_sat_solver_context() {}
 
@@ -18,19 +19,24 @@ namespace bv {
         sat::clause_info const& get_clause(unsigned idx) const override { return m_clauses[idx]; }
         ptr_iterator<unsigned> get_use_list(sat::literal lit) override { return ptr_iterator<unsigned>(nullptr, nullptr); }
         void flip(sat::bool_var v) override {  }
+        sat::bool_var external_flip() override { return sat::null_bool_var; }
         double reward(sat::bool_var v) override { return 0; }
         double get_weigth(unsigned clause_idx) override { return 0; }
         bool is_true(sat::literal lit) override { return true; }
         bool try_rotate(sat::bool_var v, sat::bool_var_set& rotated, unsigned& bound) override { return false; }
         unsigned num_vars() const override { return 0; }
         indexed_uint_set const& unsat() const override { return s; }
+        indexed_uint_set const& unsat_vars() const override { return s; }
+        void shift_weights() override {}
         void on_model(model_ref& mdl) override {}
+        unsigned num_external_in_unsat_vars() const override { return 0; }
         sat::bool_var add_var() override { return sat::null_bool_var;}
         void add_clause(unsigned n, sat::literal const* lits) override {}
         //        void collect_statistics(statistics& st) const override {}
         // void reset_statistics() override {}
         void force_restart() override {}
         std::ostream& display(std::ostream& out)  override { return out; }
+        reslimit& rlimit() override { return m_limit; }
     };
 
     class sls_test {

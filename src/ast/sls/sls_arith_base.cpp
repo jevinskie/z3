@@ -13,30 +13,12 @@ Author:
 
     Nikolaj Bjorner (nbjorner) 2023-02-07
 
+Notes:
+
     Uses quadratic solver method from nia_ls in hybrid-smt
     (with a bug fix for when order of roots are swapped)
     Other features from nia_ls are also used as a starting point, 
     such as tabu and fallbacks.
-
-Todo:
-
-- add fairness for which variable to flip and direction (by age fifo).
-  - maintain age per variable, per sign
-
-- include more general tabu measure
-  - 
-
-- random walk when there is no applicable update
-  - repair_down can fail repeatedely. Then allow a mode to reset arguments similar to 
-    repair of literals.
-
-- avoid overflow for nested products
-
-Done:
-- add tabu for flipping variable back to the same value.
-  - remember last variable/delta and block -delta = last_delta && last_variable = current_variable
-- include measures for bounded updates
-  - per variable maintain increasing range 
 
 --*/
 
@@ -110,8 +92,10 @@ namespace sls {
     template<typename num_t>
     arith_base<num_t>::arith_base(context& ctx) :
         plugin(ctx),
+        m_new_terms(m),
         a(m),
-        m_new_terms(m) {
+        m_clausal_sls(*this),
+        m_lookahead_sls(*this) {
         m_fid = a.get_family_id();
     }
 
@@ -220,7 +204,7 @@ namespace sls {
     template<typename num_t>
     static num_t sqrt(num_t d) {
         if (d <= 1)
-            return d;
+            return d;        
         auto sq = 2*sqrt(div(d, num_t(4))) + 1;
         if (sq * sq <= d)
             return sq;
@@ -233,6 +217,8 @@ namespace sls {
     template<typename num_t>
     void arith_base<num_t>::find_quadratic_moves(ineq const& ineq, var_t x, num_t const& a, num_t const& b, num_t const& sum) {
         num_t c, d;
+        if (!is_int(x)) // sqrt is not defined for non-integers
+            return;
         try {
             c = sum - a * value(x) * value(x) - b * value(x);
             d = b * b - 4 * a * c;
@@ -447,12 +433,12 @@ namespace sls {
         delta_out = delta;
 
         if (m_last_var == v && m_last_delta == -delta) {
-            TRACE("arith", tout << "flip back " << v << " " << delta << "\n";);
+            TRACE("arith_verbose", tout << "flip back " << v << " " << delta << "\n";);
             return false;
         }
 
-        if (m_use_tabu && vi.is_tabu(m_stats.m_num_steps, delta)) {
-            TRACE("arith", tout << "tabu\n");
+        if (m_use_tabu && vi.is_tabu(m_stats.m_steps, delta)) {
+            TRACE("arith_verbose", tout << "tabu v" << v << " delta:" << delta << "\n");
             return false;
         }
         
@@ -460,7 +446,7 @@ namespace sls {
         auto old_value = value(v);
         auto new_value = old_value + delta;
         if (!vi.in_range(new_value)) {
-            TRACE("arith", tout << "out of range: v" << v << " " << old_value << " " << delta << " " << new_value << "\n";);
+            TRACE("arith", display(tout, v) << "out of range: v" << v << " " << old_value << " " << delta << " " << new_value << "\n";);
             return false;
         }
 
@@ -499,9 +485,111 @@ namespace sls {
     template<typename num_t>
     void arith_base<num_t>::add_update(var_t v, num_t delta) { 
         num_t delta_out;
+        auto const& vi = m_vars[v];
         if (!is_permitted_update(v, delta, delta_out)) 
             return;        
-        m_updates.push_back({ v, delta_out, 0 }); 
+        if (vi.m_op == arith_op_kind::OP_NUM)
+            return;
+        if (is_add(v) && m_allow_recursive_delta) 
+            add_update_add(get_add(v), delta_out);
+        else if (is_mul(v) && m_allow_recursive_delta)
+            add_update_mul(get_mul(v), delta_out);
+        else if (is_op(v) && m_allow_recursive_delta) 
+            add_update(get_op(v), delta_out);        
+        else if (vi.is_if_op() && m_allow_recursive_delta) {
+            expr* c = nullptr, * t = nullptr, * e = nullptr;
+            VERIFY(m.is_ite(vi.m_expr, c, t, e));
+            bool cond = ctx.is_true(c);
+            if (cond)
+                add_update(mk_term(t), delta_out);
+            else 
+                add_update(mk_term(e), delta_out);
+        }
+        else {
+            IF_VERBOSE(3, if (!is_uninterp(vi.m_expr) && m_allow_recursive_delta)
+                verbose_stream() << mk_bounded_pp(vi.m_expr, m) << " += " << delta_out << "\n");
+            m_updates.push_back({ v, delta_out, 0 });
+        }
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::add_update(op_def const& od, num_t const& delta) {
+        switch (od.m_op) {
+        case arith_op_kind::OP_IDIV:
+        case arith_op_kind::OP_IDIV0:
+            add_update_idiv(od, delta);
+            break;
+        case arith_op_kind::OP_MOD:
+        case arith_op_kind::OP_MOD0:
+            add_update_mod(od, delta);
+            break;
+        case arith_op_kind::OP_NUM:
+            break;
+        case arith_op_kind::OP_DIV:
+        case arith_op_kind::OP_DIV0:
+        case arith_op_kind::OP_POWER:
+        default:
+            IF_VERBOSE(1, verbose_stream() << "add-update-op is TBD " << mk_bounded_pp(m_vars[od.m_var].m_expr, m) << " " << od.m_op << " " << delta << "\n");
+            break;
+        }
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::add_update_idiv(op_def const& od, num_t const& delta) {
+        num_t arg2 = value(od.m_arg2);
+        if (arg2 != 0) {
+            if (arg2 > 0)
+                add_update(od.m_arg1, delta * arg2);
+            else if (arg2 < 0)
+                add_update(od.m_arg1, -delta * arg2);
+        }
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::add_update_mod(op_def const& od, num_t const& delta) {
+        num_t arg1 = value(od.m_arg1);
+        num_t arg2 = value(od.m_arg2);
+        if (arg1 + delta >= 0 && arg1 + delta < arg2)
+            add_update(od.m_arg1, delta);
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::add_update_add(add_def const& ad, num_t const& delta) {
+        for (auto const& [coeff, w] : ad.m_args) 
+                add_update(w, divide(w, delta, coeff));
+    }
+
+
+    template<typename num_t>
+    void arith_base<num_t>::add_update_mul(mul_def const& md, num_t const& delta) {
+        auto const& [v, monomial] = md;
+        auto val = value(v) + delta;
+
+        if (val == 0) {
+            for (auto [x, p] : monomial)
+                add_update(x, -value(x));
+        }
+        else if (val == 1 || val == -1) {
+            for (auto [x, p] : monomial) {
+                add_update(x, num_t(1) - value(x));
+                add_update(x, num_t(-1) - value(x));
+            }
+        }
+        else {
+            for (auto [x, p] : monomial) {
+                auto mx = mul_value_without(v, x);
+                // val / mx = x^p
+                if (mx == 0)
+                    continue;
+                auto valmx = divide(x, val, mx);
+                if (p > 1 && !is_int(x))
+                    continue;
+                auto r = root_of(p, valmx);
+                add_update(x, r - value(x));
+                if (p % 2 == 0)
+                    add_update(x, -r - value(x));
+            }
+        }
     }
 
     // flip on the first positive score
@@ -543,10 +631,10 @@ namespace sls {
             num_t new_value = value(v) + delta;
 
 
-            if (update(v, new_value)) {
+            if (update_checked(v, new_value)) {
                 m_last_delta = delta;
-                m_stats.m_num_steps++;
-                m_vars[v].set_step(m_stats.m_num_steps, m_stats.m_num_steps + 3 + ctx.rand(10), delta);
+                m_stats.m_steps++;
+                m_vars[v].set_step(m_stats.m_steps, m_stats.m_steps + 3 + ctx.rand(10), delta);
                 return true;
             }
             sum_score -= score;
@@ -560,7 +648,7 @@ namespace sls {
     bool arith_base<num_t>::find_lin_moves(sat::literal lit) {
         m_updates.reset();
         auto* ineq = get_ineq(lit.var());
-        num_t a, b;
+        num_t a(0), b(0);
         if (!ineq)
             return false;
         if (!ineq->m_is_linear) {
@@ -652,16 +740,20 @@ namespace sls {
     }
 
     template<typename num_t>
-    bool arith_base<num_t>::update(var_t v, num_t const& new_value) {
+    bool arith_base<num_t>::update_checked(var_t v, num_t const& new_value) {
         auto& vi = m_vars[v];
         expr* e = vi.m_expr;
         auto old_value = vi.value();
         if (old_value == new_value)
             return true;                   
-        if (!vi.in_range(new_value))
+        if (!vi.in_range(new_value)) {
+            TRACE("arith", display(tout << "out of range " << new_value << ": ", v) << "\n"; );
             return false;
-        if (!in_bounds(v, new_value) && in_bounds(v, old_value))
+        }
+        if (!in_bounds(v, new_value) && in_bounds(v, old_value)) {
+            TRACE("arith", tout << "out of bounds: v" << v << " " << old_value << " " << new_value << "\n";);
             return false;
+        }
 
         // check for overflow
         try {
@@ -673,7 +765,6 @@ namespace sls {
             }
         }
         catch (overflow_exception const&) {
-            verbose_stream() << "overflow1\n";
             return false;
         }
 
@@ -690,6 +781,7 @@ namespace sls {
             
         }
         IF_VERBOSE(5, verbose_stream() << "repair: v" << v << " := " << old_value << " -> " << new_value << "\n");
+        TRACE("arith", tout << "update: v" << v << " " << mk_bounded_pp(vi.m_expr, m) << " := " << old_value << " -> " << new_value << "\n");
         vi.set_value(new_value);
         ctx.new_value_eh(e);
         m_last_var = v;
@@ -715,12 +807,10 @@ namespace sls {
                     prod *= power_of(value(w), p);
             }
             catch (overflow_exception const&) {
-                verbose_stream() << "overflow\n";
                 return false;
             }
-            if (value(w) != prod && !update(w, prod))
-                return false;
-            
+            if (value(w) != prod && !update_checked(w, prod))
+                return false;            
         }
 
         for (auto idx : vi.m_adds) {
@@ -728,9 +818,15 @@ namespace sls {
             num_t sum(ad.m_coeff);
             for (auto const& [coeff, w] : ad.m_args)
                 sum += coeff * value(w);
-            if (!update(ad.m_var, sum)) 
+            if (!update_checked(ad.m_var, sum)) 
                 return false;
         }
+
+        for (auto const& x : vi.m_ops)
+            update_checked(x, value1(x));
+
+        for (auto const& x : vi.m_ifs)
+            update_checked(x, value1(x));
 
         return true;
     }
@@ -770,6 +866,34 @@ namespace sls {
     bool arith_base<num_t>::is_num(expr* e, num_t& i) {
         UNREACHABLE();
         return false;
+    }
+
+    template<>
+    void arith_base<rational>::check_real(expr*) {}
+
+    template<>
+    void arith_base<checked_int64<true>>::check_real(expr* e) {
+        if (a.is_real(e))
+            throw overflow_exception();
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::check_real(expr* e) {
+        UNREACHABLE();
+    }
+
+
+    template<>
+    rational arith_base<rational>::to_num(rational const& r) {
+        return r;
+    }
+
+    template<>
+    checked_int64<true> arith_base<checked_int64<true>>::to_num(rational const& r) {
+        if (!r.is_int64())
+            throw overflow_exception();
+        checked_int64<true> i = r.get_int64();
+        return i;        
     }
 
     template<>
@@ -886,9 +1010,8 @@ namespace sls {
             add_arg(term, coeff, mk_op(arith_op_kind::OP_TO_INT, e, x, x));
         else if (a.is_to_real(e, x))
             add_arg(term, coeff, mk_op(arith_op_kind::OP_TO_REAL, e, x, x));       
-        else if (a.is_arith_expr(e)) {
-            NOT_IMPLEMENTED_YET();
-        }
+        else if (a.is_arith_expr(e)) 
+            throw default_exception("unsupported for sls " + mk_pp(e, m));        
         else 
             add_arg(term, coeff, mk_var(e));
     }
@@ -902,7 +1025,7 @@ namespace sls {
         num_t val;
         switch (k) {
         case arith_op_kind::OP_MOD:
-            val = value(vy) == 0 ? num_t(0) : mod(value(v), value(vy));
+            val = value(vy) == 0 ? num_t(0) : mod(value(vx), value(vy));
             break;
         case arith_op_kind::OP_REM:
             if (value(vy) == 0)
@@ -921,14 +1044,26 @@ namespace sls {
         case arith_op_kind::OP_ABS:
             val = abs(value(vx));
             break;
+        case arith_op_kind::OP_TO_INT: {
+            rational r = floor(value(vx).to_rational());
+            val = to_num(r);
+            break;
+        }
+        case arith_op_kind::OP_TO_REAL: 
+            val = value(vx);
+            break;        
         default:
-            NOT_IMPLEMENTED_YET();
+            throw default_exception("unsupported for sls " + mk_pp(e, m));
             break;
         }
         m_ops.push_back({v, k, vx, vy});
         m_vars[v].m_def_idx = idx;
         m_vars[v].m_op = k;
         m_vars[v].set_value(val);
+        m_vars[vx].m_ops.push_back(v);
+        TRACE("arith", display(tout << "initialize op ", v) << " " << value(vx) << " op " << value(vy) << "\n");
+        if (vy != vx)
+            m_vars[vy].m_ops.push_back(v);
         return v;
     }
 
@@ -956,10 +1091,18 @@ namespace sls {
     template<typename num_t>
     typename arith_base<num_t>::var_t arith_base<num_t>::mk_var(expr* e) {
         var_t v = m_expr2var.get(e->get_id(), UINT_MAX);
-        if (v == UINT_MAX) {
-            v = m_vars.size();
-            m_expr2var.setx(e->get_id(), v, UINT_MAX);
-            m_vars.push_back(var_info(e, a.is_int(e) ? var_sort::INT : var_sort::REAL));     
+        if (v != UINT_MAX)
+            return v;
+        v = m_vars.size();
+        m_expr2var.setx(e->get_id(), v, UINT_MAX);
+        m_vars.push_back(var_info(e, a.is_int(e) ? var_sort::INT : var_sort::REAL));     
+        expr* c = nullptr, * th = nullptr, * el = nullptr;
+        if (m.is_ite(e, c, th, el)) {
+            auto th_v = m_expr2var[th->get_id()];
+            auto el_v = m_expr2var[el->get_id()];
+            m_vars[th_v].m_ifs.push_back(v);
+            m_vars[el_v].m_ifs.push_back(v);
+            m_vars[v].m_def_idx = UINT_MAX - 1;
         }
         return v;
     }
@@ -999,11 +1142,11 @@ namespace sls {
         }
         else if (is_distinct(e)) {
             verbose_stream() << "distinct " << mk_pp(e, m) << "\n";
+            throw default_exception("unsupported for sls " + mk_pp(e, m));
         }
-        else if (a.is_is_int(e, x))
-        {
-            NOT_IMPLEMENTED_YET();
-        }
+        else if (a.is_is_int(e, x))        
+            throw default_exception("unsupported for sls " + mk_pp(e, m));
+        
 #if 0
         else if (a.is_idivides(e, x, y))
             NOT_IMPLEMENTED_YET();
@@ -1011,6 +1154,8 @@ namespace sls {
         else {
             SASSERT(!a.is_arith_expr(e));
         }
+        initialize_of_bool_var(bv);
+
         add_new_terms();        
     }
 
@@ -1086,6 +1231,7 @@ namespace sls {
 
         // attach i to bv
         m_ineqs.set(bv, &i);
+        m_bool_var_atoms.insert(bv);
      }
 
     template<typename num_t>
@@ -1129,7 +1275,16 @@ namespace sls {
     template<typename num_t>
     num_t arith_base<num_t>::value1(var_t v) {
         auto const& vi = m_vars[v];
-        if (vi.m_def_idx == UINT_MAX)
+
+        if (vi.is_if_op()) {
+            expr* c = nullptr, * th = nullptr, *el = nullptr;
+            VERIFY(m.is_ite(vi.m_expr, c, th, el));
+            if (ctx.is_true(c))
+                return value(mk_var(th));
+            else
+                return value(mk_var(el));
+        }
+        if (!vi.is_arith_op())
             return value(v);
 
         num_t result, v1, v2;
@@ -1137,7 +1292,7 @@ namespace sls {
         case LAST_ARITH_OP:
             break;
         case OP_ADD: {
-            auto const& ad = m_adds[vi.m_def_idx];
+            auto const& ad = get_add(v);
             auto const& args = ad.m_args;
             result = ad.m_coeff;
             for (auto [c, w] : args)
@@ -1145,37 +1300,45 @@ namespace sls {
             break;
         }
         case OP_MUL: {
-            auto const& [w, monomial] = m_muls[vi.m_def_idx];
+            auto const& [w, monomial] = get_mul(v);
             result = num_t(1);
             for (auto [w, p] : monomial)
                 result *= power_of(value(w), p);
             break;
         }
         case OP_MOD:
-            v1 = value(m_ops[vi.m_def_idx].m_arg1);
-            v2 = value(m_ops[vi.m_def_idx].m_arg2);
+            v1 = value(get_op(v).m_arg1);
+            v2 = value(get_op(v).m_arg2);
             result = v2 == 0 ? num_t(0) : mod(v1, v2);
             break;
         case OP_DIV:
-            v1 = value(m_ops[vi.m_def_idx].m_arg1);
-            v2 = value(m_ops[vi.m_def_idx].m_arg2);
+            v1 = value(get_op(v).m_arg1);
+            v2 = value(get_op(v).m_arg2);
             result = v2 == 0 ? num_t(0) : v1 / v2;
             break;
         case OP_IDIV:
-            v1 = value(m_ops[vi.m_def_idx].m_arg1);
-            v2 = value(m_ops[vi.m_def_idx].m_arg2);
+            v1 = value(get_op(v).m_arg1);
+            v2 = value(get_op(v).m_arg2);
             result = v2 == 0 ? num_t(0) : div(v1, v2);
             break;
         case OP_REM:
-            v1 = value(m_ops[vi.m_def_idx].m_arg1);
-            v2 = value(m_ops[vi.m_def_idx].m_arg2);
+            v1 = value(get_op(v).m_arg1);
+            v2 = value(get_op(v).m_arg2);
             result = v2 == 0 ? num_t(0) : v1 %= v2;
             break;
         case OP_ABS:
-            result = abs(value(m_ops[vi.m_def_idx].m_arg1));
+            result = abs(value(get_op(v).m_arg1));
             break;
+        case OP_TO_REAL:
+            result = value(get_op(v).m_arg1);
+            break;
+        case OP_TO_INT: {
+            rational r = value(get_op(v).m_arg1).to_rational();
+            result = to_num(floor(r));
+            break;
+        }
         default:
-            NOT_IMPLEMENTED_YET();
+            throw default_exception("no repair " + mk_pp(vi.m_expr, m));
         }
         return result;
     }
@@ -1193,10 +1356,10 @@ namespace sls {
         if (v == UINT_MAX)
             return;
         auto const& vi = m_vars[v];
-        if (vi.m_def_idx == UINT_MAX)
+        if (!vi.is_arith_op())
             return;
         auto new_value = value1(v);
-        if (!update(v, new_value))
+        if (!update_checked(v, new_value))
             ctx.new_value_eh(e);
     }
 
@@ -1206,35 +1369,35 @@ namespace sls {
         if (v == UINT_MAX)
             return false;
         auto const& vi = m_vars[v];
-        if (vi.m_def_idx == UINT_MAX)
+        if (!vi.is_arith_op())
             return false;
         flet<bool> _tabu(m_use_tabu, false);
-        TRACE("sls", tout << "repair def " << mk_bounded_pp(vi.m_expr, m) << "\n");
+        TRACE("sls_verbose", tout << "repair def " << mk_bounded_pp(vi.m_expr, m) << "\n");
         switch (vi.m_op) {
         case arith_op_kind::LAST_ARITH_OP:
             break;
         case arith_op_kind::OP_ADD:
-            return repair_add(m_adds[vi.m_def_idx]);
+            return repair_add(get_add(v));
         case arith_op_kind::OP_MUL:
-            return repair_mul(m_muls[vi.m_def_idx]);
+            return repair_mul(get_mul(v));
         case arith_op_kind::OP_MOD:
-            return repair_mod(m_ops[vi.m_def_idx]);
+            return repair_mod(get_op(v));
         case arith_op_kind::OP_REM:
-            return repair_rem(m_ops[vi.m_def_idx]);
+            return repair_rem(get_op(v));
         case arith_op_kind::OP_POWER:
-            return repair_power(m_ops[vi.m_def_idx]);
+            return repair_power(get_op(v));
         case arith_op_kind::OP_IDIV:
-            return repair_idiv(m_ops[vi.m_def_idx]);
+            return repair_idiv(get_op(v));
         case arith_op_kind::OP_DIV:
-            return repair_div(m_ops[vi.m_def_idx]);
+            return repair_div(get_op(v));
         case arith_op_kind::OP_ABS:
-            return repair_abs(m_ops[vi.m_def_idx]);
+            return repair_abs(get_op(v));
         case arith_op_kind::OP_TO_INT:
-            return repair_to_int(m_ops[vi.m_def_idx]);
+            return repair_to_int(get_op(v));
         case arith_op_kind::OP_TO_REAL:
-            return repair_to_real(m_ops[vi.m_def_idx]);
+            return repair_to_real(get_op(v));
         default:
-            NOT_IMPLEMENTED_YET();
+            throw default_exception("no repair " + mk_pp(e, m));
         }
         return true;
     }
@@ -1318,7 +1481,6 @@ namespace sls {
                             hi_valid = false;
                     }
                     catch (overflow_exception&) {
-                        verbose_stream() << "overflow3\n";
                         hi_valid = false;
                     }
                 }
@@ -1353,9 +1515,14 @@ namespace sls {
             case LAST_ARITH_OP:
             case OP_ADD: 
             case OP_MUL: 
+            case OP_DIV:
+            case OP_TO_INT:
+            case OP_TO_REAL:
+            case OP_IDIV:
+            case OP_REM:
                 break;
             case OP_MOD: {
-                auto v2 = m_ops[vi.m_def_idx].m_arg2;
+                auto v2 = get_op(v).m_arg2;
                 auto const& vi2 = m_vars[v2];
                 if (vi2.m_lo && vi2.m_hi && vi2.m_lo->value == vi2.m_hi->value && vi2.m_lo->value > 0) {
                     add_le(v, vi2.m_lo->value - 1);
@@ -1363,21 +1530,66 @@ namespace sls {
                 }
                 break;
             }
-            case OP_DIV:
-                break;
-            case OP_IDIV:
-                break;
-            case OP_REM:
-                break;
             case OP_ABS:
                 add_ge(v, num_t(0));
                 break;
             default:
-                NOT_IMPLEMENTED_YET();
-
+                throw default_exception("repair is not supported for " + mk_pp(e, m));
             }
-            // TBD: can also do with other operators.
         }
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::initialize_vars_of(sat::bool_var bv) {
+        auto* ineq = get_ineq(bv);
+        if (!ineq)
+            return;
+        buffer<var_t> todo;
+        for (auto const& [coeff, v] : ineq->m_args)
+            todo.push_back(v);
+        m_tmp_set.reset();
+        for (unsigned i = 0; i < todo.size(); ++i) {
+            var_t u = todo[i];
+            if (m_tmp_set.contains(u))
+                continue;
+            m_tmp_set.insert(u);
+            if (is_add(u)) {
+                auto const& ad = get_add(u);
+                for (auto const& [c, w] : ad.m_args)
+                    todo.push_back(w);
+            }
+            if (is_mul(u)) {
+                auto const& [w, monomial] = get_mul(u);
+                for (auto [w, p] : monomial)
+                    todo.push_back(w);
+            }
+            if (is_op(u)) {
+                auto const& op = get_op(u);
+                todo.push_back(op.m_arg1);
+                todo.push_back(op.m_arg2);
+            }
+            auto const& ui = m_vars[u];
+            if (ui.is_if_op()) {
+                expr* c = nullptr, * th = nullptr, * el = nullptr;
+                VERIFY(m.is_ite(ui.m_expr, c, th, el));
+                todo.push_back(mk_var(th));
+                todo.push_back(mk_var(el));
+            }
+        }
+    }
+
+    template<typename num_t>
+    void arith_base<num_t>::initialize_of_bool_var(sat::bool_var bv) {
+        initialize_vars_of(bv);
+        for (auto v : m_tmp_set)
+            m_vars[v].m_bool_vars_of.push_back(bv);
+    }
+
+    template<typename num_t> 
+    void arith_base<num_t>::initialize_clauses_of(sat::bool_var bv, unsigned ci) {
+        initialize_vars_of(bv);
+        for (auto v : m_tmp_set)
+            m_vars[v].m_clauses_of.push_back(ci);
     }
 
     template<typename num_t>
@@ -1418,9 +1630,9 @@ namespace sls {
             case ineq_kind::LE:
                 if (lit.sign()) {
                     if (c == -1) // -x + c >= 0 <=> c >= x
-                        add_le(v, ineq->m_coeff);
+                        add_lt(v, ineq->m_coeff);
                     else if (c == 1) // x + c >= 0 <=> x >= -c
-                        add_ge(v, -ineq->m_coeff);
+                        add_gt(v, -ineq->m_coeff);
                     else
                         verbose_stream() << "INITIALIZE " << lit << " " << *ineq << "\n";
                 }
@@ -1537,7 +1749,7 @@ namespace sls {
         if (apply_update())
             return eval_is_correct(v);
 
-        return update(v, sum);
+        return update_checked(v, sum);
     }
 
     template<typename num_t>
@@ -1569,7 +1781,9 @@ namespace sls {
                 // val / mx = x^p
                 if (mx == 0)
                     continue;
-                auto valmx = divide(x, val, mx);
+                if (p > 1 && !is_int(x))
+                    continue;
+                auto valmx = divide(x, val, mx);               
                 auto r = root_of(p, valmx);
                 add_update(x, r - value(x));
                 if (p % 2 == 0) 
@@ -1588,7 +1802,7 @@ namespace sls {
         if (apply_update())
             return eval_is_correct(v);
 
-        return update(v, product); 
+        return update_checked(v, product); 
     }    
 
     template<typename num_t>
@@ -1596,13 +1810,13 @@ namespace sls {
         auto v1 = value(od.m_arg1);
         auto v2 = value(od.m_arg2);
         if (v2 == 0) 
-            return update(od.m_var, num_t(0));
+            return update_checked(od.m_var, num_t(0));
         
 
         IF_VERBOSE(0, verbose_stream() << "todo repair rem");
         // bail
         v1 %= v2;
-        return update(od.m_var, v1);
+        return update_checked(od.m_var, v1);
     }
 
     template<typename num_t>
@@ -1610,11 +1824,11 @@ namespace sls {
         auto val = value(od.m_var);
         auto v1 = value(od.m_arg1);
         if (val < 0)
-            return update(od.m_var, abs(v1));
+            return update_checked(od.m_var, abs(v1));
         else if (ctx.rand(2) == 0)
-            return update(od.m_arg1, val);
+            return update_checked(od.m_arg1, val);
         else
-            return update(od.m_arg1, -val);        
+            return update_checked(od.m_arg1, -val);        
     }
 
     template<typename num_t>
@@ -1623,15 +1837,15 @@ namespace sls {
         auto v1 = value(od.m_arg1);
         if (val - 1 < v1 && v1 <= val)
             return true;
-        return update(od.m_arg1, val);        
+        return update_checked(od.m_arg1, val);        
     }
 
     template<typename num_t>
     bool arith_base<num_t>::repair_to_real(op_def const& od) {
         if (ctx.rand(20) == 0)
-            return update(od.m_var, value(od.m_arg1));
+            return update_checked(od.m_var, value(od.m_arg1));
         else 
-            return update(od.m_arg1, value(od.m_arg1));
+            return update_checked(od.m_arg1, value(od.m_arg1));
     }
 
     template<typename num_t>
@@ -1639,7 +1853,7 @@ namespace sls {
         auto v1 = value(od.m_arg1);
         auto v2 = value(od.m_arg2);
         if (v1 == 0 && v2 == 0) {
-            return update(od.m_var, num_t(0));
+            return update_checked(od.m_var, num_t(0));
         }
         IF_VERBOSE(0, verbose_stream() << "todo repair ^");
         NOT_IMPLEMENTED_YET();
@@ -1669,27 +1883,69 @@ namespace sls {
             default:
                 break;
             }
-            return update(od.m_arg1, v1);
+            return update_checked(od.m_arg1, v1);
         }
-        return update(od.m_var, v2 == 0 ? num_t(0) : mod(v1, v2));
+        return update_checked(od.m_var, v2 == 0 ? num_t(0) : mod(v1, v2));
     }
 
     template<typename num_t>
     bool arith_base<num_t>::repair_idiv(op_def const& od) {
+
+        auto val = value(od.m_var);
         auto v1 = value(od.m_arg1);
         auto v2 = value(od.m_arg2);
-        IF_VERBOSE(0, verbose_stream() << "TODO repair div");
+        if (v2 == 0 && val == 0)
+            return true;
+        if (v2 != 0 && val == div(v1, v2))
+            return true;
+        if (repair_div_idiv(od, val, v1, v2))
+            return true;
+
+        IF_VERBOSE(3, verbose_stream() << "revert repair-down " << val << " = " << v1 << " div " << v2 << "\n");
         // bail
-        return update(od.m_var, v2 == 0 ? num_t(0) : div(v1, v2));
-    }
+        return update_checked(od.m_var, v2 == 0 ? num_t(0) : div(v1, v2));
+    }   
     
     template<typename num_t>
     bool arith_base<num_t>::repair_div(op_def const& od) {
+        auto val = value(od.m_var);
         auto v1 = value(od.m_arg1);
         auto v2 = value(od.m_arg2);
-        IF_VERBOSE(0, verbose_stream() << "TODO repair /");
+        if (v2 == 0 && val == 0)
+            return true;
+        if (v2 != 0 && val == v1 / v2)
+            return true;
+
+        if (repair_div_idiv(od, val, v1, v2))
+            return true;
+
+        IF_VERBOSE(3, verbose_stream() << "revert repair-down " << val << " = " << v1 << "/" << v2 << "\n");
         // bail
-        return update(od.m_var, v2 == 0 ? num_t(0) : v1 / v2);
+        return update_checked(od.m_var, v2 == 0 ? num_t(0) : v1 / v2);
+    }
+
+    template<typename num_t>
+    bool arith_base<num_t>::repair_div_idiv(op_def const& od, num_t const& val, num_t const& v1, num_t const& v2) {
+        if (val == 1) {
+            if (v2 != 0 && ctx.rand(2) == 0)
+                return update_checked(od.m_arg1, v2);
+            if (v1 != 0 && ctx.rand(2) == 0)
+                return update_checked(od.m_arg2, v1);
+        }
+        if (val == 0) {
+            SASSERT(v2 != 0);
+            if (ctx.rand(2) == 0)
+                return update_checked(od.m_arg1, num_t(0));
+            if (ctx.rand(2) == 0)
+                return update_checked(od.m_arg2, num_t(0));
+        }
+        if (val == -1) {
+            if (v2 != 0 && ctx.rand(2) == 0)
+                return update_checked(od.m_arg1, -v2);
+            if (v1 != 0 && ctx.rand(2) == 0)
+                return update_checked(od.m_arg2, -v1);
+        }
+        return false;
     }
 
     template<typename num_t>
@@ -1723,8 +1979,7 @@ namespace sls {
 
     template<typename num_t>
     num_t arith_base<num_t>::mul_value_without(var_t m, var_t x) {
-        auto const& vi = m_vars[m];
-        auto const& [w, monomial] = m_muls[vi.m_def_idx];
+        auto const& [w, monomial] = get_mul(m);
         SASSERT(m == w);
         num_t r(1);
         for (auto [y, p] : monomial)
@@ -1782,7 +2037,9 @@ namespace sls {
         for (auto const& [x, nl] : ineq->m_nonlinear) {
             if (is_fixed(x))
                 continue;
-            if (is_linear(x, nl, b))
+            if (is_add(x) || is_mul(x) || is_op(x))
+                ;
+            else if (is_linear(x, nl, b))
                 find_linear_moves(*ineq, x, b);
             else if (is_quadratic(x, nl, a, b))
                 find_quadratic_moves(*ineq, x, a, b, ineq->m_args_value);
@@ -1831,7 +2088,7 @@ namespace sls {
     bool arith_base<num_t>::find_reset_moves(sat::literal lit) {
         m_updates.reset();
         auto* ineq = get_ineq(lit.var());        
-        num_t a, b;
+        num_t a(0), b(0);
         if (!ineq)
             return false;
         for (auto const& [x, nl] : ineq->m_nonlinear) 
@@ -1976,6 +2233,7 @@ namespace sls {
         auto v = ctx.atom2bool_var(e);
         if (v != sat::null_bool_var)
             init_bool_var(v);
+        check_real(e);
         if (!a.is_arith_expr(e) && !m.is_eq(e) && !m.is_distinct(e))
             for (auto arg : *e)
                 if (a.is_int_real(arg))
@@ -2017,9 +2275,9 @@ namespace sls {
                     if (new_value == value(v2))
                         new_value += num_t(1);
                     if (!is_fixed(v2))
-                        update(v2, new_value);
+                        update_checked(v2, new_value);
                     else if (!is_fixed(v1))
-                        update(v1, new_value);
+                        update_checked(v1, new_value);
                 }
             }
     }
@@ -2043,10 +2301,12 @@ namespace sls {
         }
         if (n == value(w))
             return true;
-         bool r = update(w, n);   
+         bool r = update_checked(w, n);   
 
          if (!r) {
-             IF_VERBOSE(2,
+             TRACE("arith", tout << "set value failed " << mk_pp(e, m) << " := " << mk_pp(v, m) << "\n";
+             display(tout, w) << " := " << value(w) << "\n";);
+             IF_VERBOSE(3,
                  verbose_stream() << "set value failed " << mk_pp(e, m) << " := " << mk_pp(v, m) << "\n";
                 display(verbose_stream(), w) << " := " << value(w) << "\n");
          }
@@ -2169,15 +2429,20 @@ namespace sls {
         return out;
     }
 
+    template<>
+    bool arith_base<rational>::var_info::is_big_num() const { return true; }
+
     template<typename num_t>
-    std::ostream& arith_base<num_t>::display(std::ostream& out, var_t v) const {
-        auto const& vi = m_vars[v];
-        auto const& lo = vi.m_lo;
-        auto const& hi = vi.m_hi;
-        out << "v" << v << " := " << vi.value() << " ";
+    bool arith_base<num_t>::var_info::is_big_num() const { return false; }
+
+    template<typename num_t>
+    std::ostream& arith_base<num_t>::var_info::display_range(std::ostream& out) const {
+        auto const& lo = m_lo;
+        auto const& hi = m_hi;
+
         if (lo || hi) {
             if (lo)
-                out << (lo->is_strict ? "(": "[") << lo->value;
+                out << (lo->is_strict ? "(" : "[") << lo->value;
             else
                 out << "(";
             out << " ";
@@ -2187,6 +2452,14 @@ namespace sls {
                 out << ")";
             out << " ";
         }
+        return out;
+    }
+
+    template<typename num_t>
+    std::ostream& arith_base<num_t>::display(std::ostream& out, var_t v) const {
+        auto const& vi = m_vars[v];
+        out << "v" << v << " := " << vi.value() << " ";
+        vi.display_range(out);
         out << mk_bounded_pp(vi.m_expr, m) << " ";
         if (is_add(v)) 
             display(out << "add: ", get_add(v)) << " ";
@@ -2247,61 +2520,63 @@ namespace sls {
     template<typename num_t>
     bool arith_base<num_t>::eval_is_correct(var_t v) {
         auto const& vi = m_vars[v];
-        if (vi.m_def_idx == UINT_MAX)
+        if (!vi.is_arith_op())
             return true;
-        IF_VERBOSE(4, verbose_stream() << vi.m_op << " repair def " << mk_bounded_pp(vi.m_expr, m) << "\n");
-        TRACE("sls", tout << "repair def " << mk_bounded_pp(vi.m_expr, m) << "\n");
+        IF_VERBOSE(10, verbose_stream() << vi.m_op << " repair def " << mk_bounded_pp(vi.m_expr, m) << "\n");
+        TRACE("sls_verbose", tout << "repair def " << mk_bounded_pp(vi.m_expr, m) << "\n");
         switch (vi.m_op) {
         case arith_op_kind::LAST_ARITH_OP:
             break;
         case arith_op_kind::OP_ADD: {
-            auto ad = m_adds[vi.m_def_idx];
+            auto ad = get_add(v);
             num_t sum(ad.m_coeff);
             for (auto [c, w] : ad.m_args)
                 sum += c * value(w);
             return sum == value(v);
         }
         case arith_op_kind::OP_MUL: {
-            auto md = m_muls[vi.m_def_idx];
+            auto md = get_mul(v);
             num_t prod(1);
             for (auto [w, p] : md.m_monomial)
                 prod *= power_of(value(w), p);
             return prod == value(v);
         }
         case arith_op_kind::OP_MOD: {
-            auto od = m_ops[vi.m_def_idx];
+            auto od = get_op(v);
             return value(v) == (value(od.m_arg2) == 0 ? num_t(0) : mod(value(od.m_arg1), value(od.m_arg2)));
         }
         case arith_op_kind::OP_REM: {
-            auto od = m_ops[vi.m_def_idx];
+            auto od = get_op(v);
             return value(v) == (value(od.m_arg2) == 0 ? num_t(0) : mod(value(od.m_arg1), value(od.m_arg2)));
         }
         case arith_op_kind::OP_POWER: {
-            //auto od = m_ops[vi.m_def_idx];
-            NOT_IMPLEMENTED_YET();
+            //auto od = get_op(v);
+            throw default_exception("unsupported " + mk_pp(vi.m_expr, m));
             break;
         }
         case arith_op_kind::OP_IDIV: {
-            auto od = m_ops[vi.m_def_idx];
+            auto od = get_op(v);
             return value(v) == (value(od.m_arg2) == 0 ? num_t(0) : div(value(od.m_arg1), value(od.m_arg2)));
         }           
         case arith_op_kind::OP_DIV: {
-            auto od = m_ops[vi.m_def_idx];
+            auto od = get_op(v);
             return value(v) == (value(od.m_arg2) == 0 ? num_t(0) : value(od.m_arg1) / value(od.m_arg2));
         }
         case arith_op_kind::OP_ABS: {
-            auto od = m_ops[vi.m_def_idx];
+            auto od = get_op(v);
             return value(v) == abs(value(od.m_arg1));
         }
         case arith_op_kind::OP_TO_INT: {
-            // auto od = m_ops[vi.m_def_idx];
-            NOT_IMPLEMENTED_YET();
-            break;
+            auto od = get_op(v);
+            auto val = value(od.m_var);
+            auto v1 = value(od.m_arg1);
+            return val - 1 < v1 && v1 <= val;
         }
         case arith_op_kind::OP_TO_REAL: {
-            // auto od = m_ops[vi.m_def_idx];
-            NOT_IMPLEMENTED_YET();
-            break;
+            auto od = get_op(v);
+            auto val = value(od.m_var);
+            auto v1 = value(od.m_arg1);
+            return val == v1;
         }
         default: {
             NOT_IMPLEMENTED_YET();
@@ -2360,8 +2635,7 @@ namespace sls {
         for (auto const& [c, v] : i.m_args)
             val += c * value(v);
         if (val != i.m_args_value) {
-            verbose_stream() << val << ": " << i << "\n";
-            display(verbose_stream());
+            IF_VERBOSE(0, verbose_stream() << val << ": " << i << "\n"; display(verbose_stream()));
             TRACE("arith", display(tout << val << ": " << i << "\n"));
         }
         SASSERT(val == i.m_args_value);
@@ -2371,660 +2645,31 @@ namespace sls {
 
     template<typename num_t>
     void arith_base<num_t>::collect_statistics(statistics& st) const {
-        st.update("sls-arith-flips", m_stats.m_num_steps);
-        st.update("sls-arith-moves", m_stats.m_moves);
+        st.update("sls-arith-steps", m_stats.m_steps);
+        st.update("sls-arith-propagations", m_stats.m_propagations);
     }
 
     template<typename num_t>
     void arith_base<num_t>::reset_statistics() {
-        m_stats.m_num_steps = 0;
+        m_stats.m_steps = 0;
     }
 
-    // global lookahead mode
-    // 
-
-    template<typename num_t>
-    typename arith_base<num_t>::bool_info& arith_base<num_t>::get_bool_info(expr* e) {   
-        unsigned id = e->get_id();
-        if (id >= m_bool_info.size())
-            m_bool_info.reserve(id + 1, bool_info(m_config.paws_init));
-        return m_bool_info[id];
-    }
-
-    template<typename num_t>
-    bool arith_base<num_t>::get_bool_value_rec(expr* e) {        
-        if (!is_app(e))
-            return ctx.get_value(e) == l_true;
-
-        if (is_uninterp(e))
-            return ctx.get_value(e) == l_true;
-
-        app* ap = to_app(e);
-        bool is_arith_eq = m.is_eq(e) && a.is_int_real(ap->get_arg(0));
-        
-        if (ap->get_family_id() == basic_family_id && !is_arith_eq) 
-            return get_basic_bool_value(ap);                    
-
-        auto v = ctx.atom2bool_var(e);
-        if (v == sat::null_bool_var)
-            return false;
-        auto const* ineq = get_ineq(v);
-        if (!ineq)
-            return false;
-        return ineq->is_true();
-    }    
-
-    template<typename num_t>
-    bool arith_base<num_t>::get_bool_value(expr* e) {
-        auto& info = get_bool_info(e);
-        if (info.value != l_undef)
-            return info.value == l_true;
-
-        auto r = get_bool_value_rec(e);
-        info.value = to_lbool(r);
-        return r;
-    }
+ 
 
 
     template<typename num_t>
-    bool arith_base<num_t>::get_basic_bool_value(app* e) {
-        switch (e->get_decl_kind()) {
-        case OP_TRUE:
+    bool arith_base<num_t>::update_num(var_t v, num_t const& delta) {
+        if (delta == 0)
             return true;
-        case OP_FALSE:
+        if (!can_update_num(v, delta))
             return false;
-        case OP_NOT:
-            return !get_bool_value(e->get_arg(0));
-        case OP_AND:
-            return all_of(*e, [&](expr* arg) { return get_bool_value(arg); });
-        case OP_OR:
-            return any_of(*e, [&](expr* arg) { return get_bool_value(arg); });
-        case OP_XOR:
-            return xor_of(*e, [&](expr* arg) { return get_bool_value(arg); });
-        case OP_IMPLIES:
-            return !get_bool_value(e->get_arg(0)) || get_bool_value(e->get_arg(1));
-        case OP_EQ:
-            if (m.is_bool(e->get_arg(0)))
-                return get_bool_value(e->get_arg(0)) == get_bool_value(e->get_arg(1));
-            return ctx.get_value(e->get_arg(0)) == ctx.get_value(e->get_arg(1));            
-        case OP_DISTINCT:
-            return false;
-        default:
-            NOT_IMPLEMENTED_YET();
-        }
-        return false;
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::initialize_bool_assignment() {
-        for (auto t : ctx.subterms()) 
-            if (m.is_bool(t))
-                set_bool_value(t, get_bool_value_rec(t));    
-#if 0
-        for (auto t : ctx.subterms()) {
-            if (m.is_bool(t))
-                verbose_stream() << mk_bounded_pp(t, m) << " := " << get_bool_value(t) << "\n";
-            else
-                verbose_stream() << mk_bounded_pp(t, m) << " := " << ctx.get_value(t) << "\n";
-        }
-#endif
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::finalize_bool_assignment() {
-        for (unsigned v = ctx.num_bool_vars(); v-- > 0; ) {
-            auto a = ctx.atom(v);
-            if (!a)
-                continue;
-            if (get_bool_value(a) != ctx.is_true(v))
-                ctx.flip(v);
-        }
-#if 0
-        for (auto idx : ctx.unsat()) {
-            auto const& cl = ctx.get_clause(idx);
-            verbose_stream() << "clause " << cl << "\n";
-            for (auto lit : cl) {
-                auto a = ctx.atom(lit.var());
-                if (a)
-                    verbose_stream() << lit << " " << mk_bounded_pp(a, m) << " " << get_bool_value(a) << " " << ctx.is_true(lit) << "\n";
-                else
-                    verbose_stream() << lit << " " << ctx.is_true(lit) << "\n";
-            }
-        }
-#endif
-
-    }
-
-    template<typename num_t>
-    double arith_base<num_t>::new_score(expr* e) {
-        return new_score(e, true);
-    }
-
-    template<typename num_t>
-    double arith_base<num_t>::new_score(expr* a, bool is_true) {
-        bool is_true_new = get_bool_value(a);
-
-        if (is_true == is_true_new)
-            return 1;
-        if (is_uninterp(a))
-            return 0;
-        if (m.is_true(a))
-            return is_true ? 1 : 0;
-        if (m.is_false(a))
-            return is_true ? 0 : 1;
-        expr* x, * y, * z;
-        if (m.is_not(a, x))
-            return new_score(x, !is_true);
-        if ((m.is_and(a) && is_true) || (m.is_or(a) && !is_true)) {
-            double score = 1;
-            for (auto arg : *to_app(a))
-                score = std::min(score, new_score(arg, is_true));
-            return score;
-        }
-        if ((m.is_and(a) && !is_true) || (m.is_or(a) && is_true)) {
-            double score = 0;
-            for (auto arg : *to_app(a))
-                score = std::max(score, new_score(arg, is_true));
-            return score;
-        }
-        if (m.is_iff(a, x, y)) {
-            auto v0 = get_bool_value(x);
-            auto v1 = get_bool_value(y);
-            return (is_true == (v0 == v1)) ? 1 : 0;
-        }
-        if (m.is_ite(a, x, y, z))
-            return get_bool_value(x) ? new_score(y, is_true) : new_score(z, is_true);
-
-
-        auto v = ctx.atom2bool_var(a);
-        if (v == sat::null_bool_var)
-            return 0;
-        auto const* ineq = get_ineq(v);
-        if (!ineq)
-            return 0;
-
-        auto const& args = ineq->m_args_value;
-        auto const& coeff = ineq->m_coeff;
-        auto value = args + coeff;
-
-        switch (ineq->m_op) {
-        case ineq_kind::LE: 
-            if (is_true) {
-                if (value <= 0)
-                    return 1.0;
-            }
-            else {
-                if (value > 0)
-                    return 1.0;
-                value = -value + 1;               
-            }
-            break;
-        case ineq_kind::LT:
-            if (is_true) {
-                if (value < 0)
-                    return 1.0;
-            }
-            else {
-                if (value >= 0)
-                    return 1.0;
-                value = -value;
-            }
-            break;
-        case ineq_kind::EQ:
-            if (is_true) {
-                if (value == 0)
-                    return 1.0;
-                if (value < 0)
-                    value = -value;
-            }
-            else {
-                if (value != 0)
-                    return 1.0;
-                return 0.0;
-            }
-            break;
-        }        
-
-
-        SASSERT(value > 0);
-        unsigned max_value = 1000;
-        if (value > max_value)
-            return 0.0;
-        auto d = value.get_double();
-        double score = 1.0 - ((d * d) / ((double)max_value * (double)max_value));
-        //score = 1.0 - d / max_value;
-        return score;
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::rescore() {
-        m_top_score = 0;
-        m_is_root.reset();
-        for (auto a : ctx.input_assertions()) {
-            double score = new_score(a);
-            set_score(a, score);
-            m_top_score += score;
-            m_is_root.mark(a);
-        }
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::recalibrate_weights() {
-        for (auto a : ctx.input_assertions()) {
-            if (ctx.rand(2047) < m_config.paws_sp) {
-                if (get_bool_value(a))
-                    dec_weight(a);
-            }
-            else if (!get_bool_value(a))
-                inc_weight(a);
-        }        
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::insert_update_stack_rec(expr* t) {
-        m_min_depth = m_max_depth = get_depth(t);
-        insert_update_stack(t);
-        for (unsigned depth = m_max_depth; depth <= m_max_depth; ++depth) {
-            for (unsigned i = 0; i < m_update_stack[depth].size(); ++i) {
-                auto a = m_update_stack[depth][i];
-                for (auto p : ctx.parents(a)) {
-                    insert_update_stack(p);
-                    m_max_depth = std::max(m_max_depth, get_depth(p));
-                }
-            }
-        }
-        m_update_stack.reserve(m_max_depth + 1);
-    }
-    template<typename num_t>
-    double arith_base<num_t>::lookahead(expr* t, bool update_score) {
-        ctx.rlimit().inc();
-        SASSERT(a.is_int_real(t) || m.is_bool(t));
-        double score = m_top_score;
-        for (unsigned depth = m_min_depth; depth <= m_max_depth; ++depth) {
-            for (unsigned i = 0; i < m_update_stack[depth].size(); ++i) {
-                auto* a = m_update_stack[depth][i];
-                TRACE("bv_verbose", tout << "update " << mk_bounded_pp(a, m) << " depth: " << depth << "\n";);
-                if (t != a)
-                    set_bool_value(a, get_bool_value_rec(a));
-                if (m_is_root.is_marked(a)) {
-                    auto nscore = new_score(a);
-                    score += get_weight(a) * (nscore - old_score(a));
-                    if (update_score)
-                        set_score(a, nscore);
-                }
-            }
-        }
-        return score;
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::insert_update_stack(expr* t) {
-        unsigned depth = get_depth(t);
-        m_update_stack.reserve(depth + 1);
-        if (!m_in_update_stack.is_marked(t) && is_app(t)) {
-            m_in_update_stack.mark(t);
-            m_update_stack[depth].push_back(to_app(t));
-        }
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::clear_update_stack() {
-        m_in_update_stack.reset();
-        m_update_stack.reserve(m_max_depth + 1);
-        for (unsigned i = m_min_depth; i <= m_max_depth; ++i)
-            m_update_stack[i].reset();        
-    }
-
-    template<typename num_t>
-    void arith_base<num_t>::lookahead_num(var_t v, num_t const& delta) {       
-        num_t old_value = value(v);
-
-        expr* e = m_vars[v].m_expr;
-        if (m_last_expr != e) {
-            if (m_last_expr)
-                lookahead(m_last_expr, false);
-            clear_update_stack();
-            insert_update_stack_rec(e);
-            m_last_expr = e;
-        }
-        else if (m_last_delta == delta)
-            return;
-        m_last_delta = delta;
-
+        auto& vi = m_vars[v];
+        auto old_value = vi.value();
         num_t new_value = old_value + delta;
-
-        if (!update_num(v, delta))
-            return;
-        auto score = lookahead(e, false);
-        TRACE("arith_verbose", tout << "lookahead " << v << " " << mk_bounded_pp(e, m) << " := " << delta + old_value << " " << score << " (" << m_best_score << ")\n";);
-        if (score > m_best_score) {
-            m_best_score = score;
-            m_best_value = new_value;
-            m_best_expr = e;
-        }
-
-        // revert back to old value
-        update_args_value(v, old_value);
+        update_unchecked(v, new_value);
+        return true;
     }
-
-    template<typename num_t>
-    void arith_base<num_t>::lookahead_bool(expr* e) {
-        bool b = get_bool_value(e);
-        set_bool_value(e, !b);
-        auto score = lookahead(e, false);
-        if (score > m_best_score) {
-            m_best_score = score;            
-            m_best_expr = e;
-        }
-        set_bool_value(e, b);   
-        lookahead(e, false);
-    }
-
-    // for every variable e, for every atom containing e
-    // add lookahead for e.
-    // m_fixable_atoms contains atoms that can be fixed.
-    // m_fixable_vars  contains variables that can be updated.
-    template<typename num_t>
-    void arith_base<num_t>::add_lookahead(bool_info& i, expr* e) {
-
-        auto add_atom = [&](sat::bool_var bv) {
-            if (!i.fixable_atoms.contains(bv))
-                return;
-            if (m_fixed_atoms.contains(bv))
-                return;
-            auto a = ctx.atom(bv);
-            if (!a)
-                return;
-            auto* ineq = get_ineq(bv);
-            if (!ineq)
-                return;
-            num_t na, nb;
-            for (auto const& [x, nl] : ineq->m_nonlinear) {
-                if (!i.fixable_vars.contains(x))
-                    continue;
-                if (is_fixed(x))
-                    continue;
-                if (is_linear(x, nl, nb))
-                    find_linear_moves(*ineq, x, nb);
-                else if (is_quadratic(x, nl, na, nb))
-                    find_quadratic_moves(*ineq, x, na, nb, ineq->m_args_value);
-                else
-                    ;
-            }
-            m_fixed_atoms.insert(bv);
-        };
-
-        auto add_finite_domain = [&](var_t v) {
-            auto old_value = value(v);
-            for (auto const& n : m_vars[v].m_finite_domain) 
-                add_update(v, n - old_value);            
-        };
-
-
-        if (m.is_bool(e)) {
-            auto bv = ctx.atom2bool_var(e);
-            if (i.fixable_atoms.contains(bv))
-                lookahead_bool(e);                      
-        }
-        else if (a.is_int_real(e)) {
-            auto v = mk_term(e);
-            auto& vi = m_vars[v];
-            if (false && !vi.m_finite_domain.empty()) {
-                add_finite_domain(v);
-                return;
-            }
-            for (auto const& [coeff, bv] : vi.m_linear_occurs) 
-                add_atom(bv);
-            for (auto const& idx : vi.m_muls) {
-                auto const& [x, monomial] = m_muls[idx];
-                for (auto [coeff, bv] : m_vars[x].m_linear_occurs)
-                    add_atom(bv);
-            }
-        }
-    }
-
-    //
-    // e is a formula that is false, 
-    // assemble candidates that can flip the formula to true.
-    // candidate expressions may be either numeric or boolean variables.
-    //
-    template<typename num_t>
-    ptr_vector<expr> const& arith_base<num_t>::get_fixable_exprs(expr* e) {
-        auto& i = get_bool_info(e);
-        if (!i.fixable_exprs.empty())
-            return i.fixable_exprs;
-        expr_mark visited;
-        ptr_buffer<expr> todo;
-
-        todo.push_back(e); 
-        while (!todo.empty()) {
-            auto e = todo.back();
-            todo.pop_back();
-            if (visited.is_marked(e))
-                continue;
-            visited.mark(e);           
-            if (m.is_xor(e) || m.is_and(e) || m.is_or(e) || m.is_implies(e) || m.is_iff(e) || m.is_ite(e) || m.is_not(e)) {
-                for (auto arg : *to_app(e))
-                    todo.push_back(arg);
-            }
-            else {
-                auto bv = ctx.atom2bool_var(e);
-                if (bv == sat::null_bool_var)
-                    continue;
-                if (is_uninterp(e)) {
-                    if (!i.fixable_atoms.contains(bv)) {
-                        i.fixable_atoms.insert(bv);
-                        i.fixable_exprs.push_back(e);
-                    }
-                    continue;
-                }
-                auto* ineq = get_ineq(bv);
-                if (!ineq)
-                    continue;
-                i.fixable_atoms.insert(bv);
-                buffer<var_t> vars;
-                
-                for (auto& [v, occ] : ineq->m_nonlinear) 
-                    vars.push_back(v);
-                
-                for (unsigned j = 0; j < vars.size(); ++j) {
-                    auto v = vars[j];
-                    if (i.fixable_vars.contains(v))
-                        continue;
-                    
-                    if (is_add(v)) {
-                        for (auto [c, w] : get_add(v).m_args)
-                            vars.push_back(w);
-                    }
-                    else if (is_mul(v)) {
-                        for (auto [w, p] : get_mul(v).m_monomial)
-                            vars.push_back(w);
-                    }
-                    else {
-                        i.fixable_exprs.push_back(m_vars[v].m_expr);
-                        i.fixable_vars.insert(v);
-                    }
-                }
-            }
-        }
-        return i.fixable_exprs;
-    }
-
-    template<typename num_t>
-    bool arith_base<num_t>::apply_move(expr* f, ptr_vector<expr> const& vars, arith_move_type t) {
-        if (vars.empty())
-            return false;
-        auto& info = get_bool_info(f);
-        m_best_expr = nullptr;
-        m_best_score = m_top_score;
-        unsigned sz = vars.size();
-        unsigned start = ctx.rand();
-        m_updates.reset();
-        m_fixed_atoms.reset();
-
-        switch (t) {
-        case arith_move_type::random_update: {
-            for (unsigned i = 0; i < sz; ++i)
-                add_lookahead(info, vars[(start + i) % sz]);
-            if (m_updates.empty())
-                return false;
-            unsigned idx = ctx.rand() % m_updates.size();
-            auto& [v, delta, score] = m_updates[idx];
-            m_best_expr = m_vars[v].m_expr;
-            if (false && !m_vars[v].m_finite_domain.empty())
-                m_best_value = m_vars[v].m_finite_domain[ctx.rand() % m_vars[v].m_finite_domain.size()];
-            else
-                m_best_value = value(v) + delta;
-            break;
-        }
-        case arith_move_type::hillclimb: {
-            for (unsigned i = 0; i < sz; ++i)
-                add_lookahead(info, vars[(start + i) % sz]);
-            if (m_updates.empty())
-                return false;
-            std::stable_sort(m_updates.begin(), m_updates.end(), [](auto const& a, auto const& b) { return a.m_var < b.m_var || (a.m_var == b.m_var && a.m_delta < b.m_delta); });
-            m_last_expr = nullptr;
-            sz = m_updates.size();
-            for (unsigned i = 0; i < sz; ++i) {
-                auto const& [v, delta, score] = m_updates[(start + i) % m_updates.size()];
-                lookahead_num(v, delta);
-            }
-            if (m_last_expr) {
-                lookahead(m_last_expr, false);
-                clear_update_stack();
-            }
-            break;
-        }
-        case arith_move_type::random_inc_dec: {
-            auto e = vars[ctx.rand() % sz];
-            m_best_expr = e;
-            if (a.is_int_real(e)) {
-                var_t v = mk_term(e);
-                auto& vi = m_vars[v];
-                if (!vi.m_finite_domain.empty()) 
-                    m_best_value = vi.m_finite_domain[ctx.rand() % vi.m_finite_domain.size()];                
-                else if (ctx.rand(2) == 0)
-                    m_best_value = value(v) + 1;
-                else
-                    m_best_value = value(v) - 1;
-            }
-            break;
-        }
-        }
-
-        if (m_best_expr) {            
-            if (m.is_bool(m_best_expr))
-                set_bool_value(m_best_expr, !get_bool_value(m_best_expr));
-            else {
-                var_t v = mk_term(m_best_expr);
-                if (!update_num(v, m_best_value - value(v))) {
-                    TRACE("arith",
-                        tout << "could not move v" << v << " " << t << " " << mk_bounded_pp(m_best_expr, m) << " := " << value(v) << " " << m_top_score << "\n";
-                        );
-                    return false;
-                }
-            }
-            insert_update_stack_rec(m_best_expr);
-            m_top_score = lookahead(m_best_expr, true);
-            clear_update_stack();
-        }
-                
-        CTRACE("arith", !m_best_expr, tout << "no move " << t << "\n";);
-        CTRACE("arith", m_best_expr && a.is_int_real(m_best_expr), {
-            var_t v = mk_term(m_best_expr);
-            tout << t << " v" << v << " " << mk_bounded_pp(m_best_expr, m) << " := " << value(v) << " " << m_top_score << "\n";
-            });
-        return !!m_best_expr;
-    }
-
-
-    std::ostream& operator<<(std::ostream& out, arith_move_type mt) {
-        switch (mt) {
-        case arith_move_type::random_update: out << "random-update"; break;
-        case arith_move_type::hillclimb: out << "hillclimb"; break;
-        case arith_move_type::random_inc_dec: out << "random-inc-dec"; break;
-        }
-        return out;
-    }
-
-    template<typename num_t>
-    void  arith_base<num_t>::global_search() {
-        initialize_bool_assignment();
-        rescore();
-        m_config.max_moves = m_stats.m_moves + m_config.max_moves_base;
-        TRACE("arith", tout << "search " << m_stats.m_moves << " " << m_config.max_moves << "\n";);
-        IF_VERBOSE(3, verbose_stream() << "lookahead-search moves:" << m_stats.m_moves << " max-moves:" << m_config.max_moves << "\n");
-        TRACE("arith", display(tout));
-
-        while (ctx.rlimit().inc() && m_stats.m_moves < m_config.max_moves) {
-            m_stats.m_moves++;
-            check_restart();
-
-            auto t = get_candidate_unsat();
-
-            if (!t) 
-                break;
-            
-            auto& vars = get_fixable_exprs(t);
-
-            if (vars.empty()) 
-                break;            
-
-            if (ctx.rand(2047) < m_config.wp && apply_move(t, vars, arith_move_type::random_inc_dec))
-                continue;
-
-            if (apply_move(t, vars, arith_move_type::hillclimb))
-                continue;
-
-            if (apply_move(t, vars, arith_move_type::random_update))
-                recalibrate_weights();
-        }
-        if (m_stats.m_moves >= m_config.max_moves)
-            m_config.max_moves_base += 100;
-        finalize_bool_assignment();
-    }
-
-    template<typename num_t>
-    expr* arith_base<num_t>::get_candidate_unsat() {
-        expr* e = nullptr;
-        if (m_config.ucb) {
-            double max = -1.0;            
-            for (auto a : ctx.input_assertions()) {
-                if (get_bool_value(a))
-                    continue;
-
-                auto const& vars = get_fixable_exprs(a);
-                if (vars.empty())
-                    continue;
-                auto score = old_score(a);
-                auto q = score
-                    + m_config.ucb_constant * ::sqrt(log((double)m_touched) / get_touched(a))
-                    + m_config.ucb_noise * ctx.rand(512);
-                if (q > max)
-                    max = q, e = a;
-            }
-            if (e) {
-                m_touched++;
-                inc_touched(e);
-            }
-        }
-        else {
-            unsigned n = 0;
-            for (auto a : ctx.input_assertions())
-                if (!get_bool_value(a) && !get_fixable_exprs(a).empty() && ctx.rand() % ++n == 0)
-                    e = a;
-        }
-
-        m_last_atom = e;
-        CTRACE("arith", !e, tout << "no unsatisfiable candidate\n";);
-        CTRACE("arith", e, 
-            tout << "select " << mk_bounded_pp(e, m) << " ";
-            for (auto v : get_fixable_exprs(e)) 
-                tout << mk_bounded_pp(v, m) << " ";        
-            tout << "\n");
-        return e;
-    }
-
+    
     template<typename num_t>
     bool arith_base<num_t>::can_update_num(var_t v, num_t const& delta) {
         num_t old_value = value(v);
@@ -3034,11 +2679,11 @@ namespace sls {
         if (old_value == new_value)
             return true;
         if (!vi.in_range(new_value)) {
-            TRACE("arith", tout << "Not in range v" << v << " " << new_value << "\n");
+            TRACE("arith_verbose", tout << "Not in range v" << v << " " << new_value << "\n");
             return false;
         }
         if (!in_bounds(v, new_value) && in_bounds(v, old_value)) {
-            TRACE("arith", tout << "out of bounds v" << v << " " << new_value << "\n");
+            TRACE("arith_verbose", tout << "out of bounds v" << v << " " << new_value << "\n");
             //verbose_stream() << "out of bounds v" << v << " " << new_value << "\n";
             return false;
         }
@@ -3059,82 +2704,45 @@ namespace sls {
     }
 
     template<typename num_t>
-    bool arith_base<num_t>::update_num(var_t v, num_t const& delta) {
-        if (delta == 0)
-            return true;
-        if (!can_update_num(v, delta))
-            return false;
+    void arith_base<num_t>::update_unchecked(var_t v, num_t const& new_value) {
         auto& vi = m_vars[v];
-        auto old_value = vi.value();
-        num_t new_value = old_value + delta;
-        update_args_value(v, new_value);
-        return true;
-    }
+        auto old_value = value(v);
+        IF_VERBOSE(5, verbose_stream() << "update: v" << v << " " << mk_bounded_pp(vi.m_expr, m) << " := " << old_value << " -> " << new_value << "\n");
+        TRACE("arith", tout << "update: v" << v << " " << mk_bounded_pp(vi.m_expr, m) << " := " << old_value << " -> " << new_value << "\n");
+        vi.set_value(new_value);
+        ctx.new_value_eh(vi.m_expr);
 
-    template<typename num_t>
-    void arith_base<num_t>::update_args_value(var_t v, num_t const& new_value) {
-        auto& vi = m_vars[v];
+        for (auto const& [coeff, bv] : vi.m_linear_occurs) {
+            auto& ineq = *get_ineq(bv);
+            ineq.m_args_value += coeff * (new_value - old_value);
+        }
 
         for (auto const& idx : vi.m_muls) {
             auto& [x, monomial] = m_muls[idx];
             num_t new_prod(1);
-            for (auto [w, p] : monomial) 
-                new_prod *= power_of(v == w ? new_value : value(w), p);            
-            update_args_value(x, new_prod);
+            for (auto [w, p] : monomial)
+                new_prod *= power_of(value(w), p);
+            update_unchecked(x, new_prod);
         }
 
         for (auto const& idx : vi.m_adds) {
             auto& ad = m_adds[idx];
             num_t new_sum(ad.m_coeff);
             for (auto [c, w] : ad.m_args)
-                new_sum += c * (v == w ? new_value : value(w));
-            update_args_value(ad.m_var, new_sum);
+                new_sum += c * value(w);
+            update_unchecked(ad.m_var, new_sum);
         }
 
-        auto old_value = value(v);
-        for (auto const& [coeff, bv] : vi.m_linear_occurs) {
-            auto& ineq = *get_ineq(bv);
-            ineq.m_args_value += coeff * (new_value - old_value);
-        }
-        IF_VERBOSE(5, verbose_stream() << "update: v" << v << " " << mk_bounded_pp(vi.m_expr, m) << " := " << old_value << " -> " << new_value << "\n");
-        vi.set_value(new_value);
+        for (auto const& x : vi.m_ops) 
+            update_unchecked(x, value1(x));
+
+        for (auto const& x : vi.m_ifs)
+            update_unchecked(x, value1(x));
+        
     }
 
-    template<typename num_t>
-    void arith_base<num_t>::check_restart() {
-        if (m_stats.m_moves % m_config.restart_base == 0) {
-            ucb_forget();
-            rescore();
-        }
+   
 
-        if (m_stats.m_moves < m_config.restart_next)
-            return;
-
-        ++m_stats.m_restarts;
-        m_config.restart_next = std::max(m_config.restart_next, m_stats.m_moves);
-
-        if (0x1 == (m_stats.m_restarts & 0x1))
-            m_config.restart_next += m_config.restart_base;
-        else
-            m_config.restart_next += (2 * (m_stats.m_restarts >> 1)) * m_config.restart_base;
-
-        // reset_uninterp_in_false_literals
-        rescore();
-
-    }
-
-
-    template<typename num_t>
-    void arith_base<num_t>::ucb_forget() {
-        if (m_config.ucb_forget >= 1.0)
-            return;
-        for (auto a : ctx.input_assertions()) {
-            auto touched_old = get_touched(a);
-            auto touched_new = static_cast<unsigned>((touched_old - 1) * m_config.ucb_forget + 1);
-            set_touched(a, touched_new);
-            m_touched += touched_new - touched_old;
-        }
-    }
 
     template<typename num_t>
     void arith_base<num_t>::updt_params() {
@@ -3150,18 +2758,23 @@ namespace sls {
         //m_config.ucb_forget = p.ucb_forget();
         m_config.wp = p.wp();
         m_config.restart_base = p.restart_base();
-        //m_config.restart_next = p.restart_next();
+        m_config.restart_next = p.restart_base();
         //m_config.max_moves_base = p.max_moves_base();
         //m_config.max_moves = p.max_moves();
-        m_config.arith_use_lookahead = p.arith_use_lookahead();
+        m_config.use_lookahead = p.arith_use_lookahead();
+        m_config.use_clausal_lookahead = p.arith_use_clausal_lookahead();
+        m_config.allow_plateau = p.arith_allow_plateau();
         m_config.config_initialized = true;
     }
 
     template<typename num_t>
     void arith_base<num_t>::start_propagation() {
-        updt_params();
-        if (m_config.arith_use_lookahead)
-            global_search();
+        ++m_stats.m_propagations;
+        updt_params();    
+        if (m_config.use_clausal_lookahead)
+            m_clausal_sls.search();
+        else if (m_config.use_lookahead)
+            m_lookahead_sls.search();
     }
 
 }
